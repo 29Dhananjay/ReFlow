@@ -275,25 +275,3 @@ reflow/
 The classes in `architectures/` match the pickled layout of the two local
 checkpoints exactly — renaming an attribute or folding blocks into
 `nn.Sequential` breaks loading.
-
-## Reading the variance ratio
-
-η_ℓ is measured on identical cached batches replayed through the dense, pruned
-and reflowed models, so the three curves are directly comparable. Two things are
-worth knowing when interpreting a run:
-
-- **Reflow lands near 1.0, sometimes above it.** ResNet-50 comes back to a
-  median η of 0.996; ResNeXt-101 settles at 1.383. Overshoot is expected rather
-  than a fault: after reflow, post-BN variance is γ² by construction, while the
-  dense reference divides by running statistics accumulated during training,
-  which need not match dense activations on the calibration batches. The
-  denominator, not the numerator, is what drifts.
-- **It is the same measurement for both strategies.** On ViT-B/16 the LayerNorm
-  outputs decay to a median η of 0.612 under pruning and come back to 0.986
-  after calibration — the same curve shape as the CNNs, which is the evidence
-  that ReFlow-BN and ReFlow-LN are treating one phenomenon by two routes.
-- **The last stage of some networks inflates rather than decays.** ResNeXt-101's
-  `layer4` runs η > 1 even before reflow (3.888 at the final layer), so the
-  final-layer value alone would read as though reflow made things worse. That is
-  why the summary reports the median over layers as well — the median is the
-  robust read of whether the signal collapsed.
