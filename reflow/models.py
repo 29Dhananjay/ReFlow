@@ -7,9 +7,14 @@ also which dataset it was trained on and the top-1 accuracy the weights are
 published with -- the CLI prints that number next to the measured baseline so a
 broken data path or transform shows up immediately.
 
-Every model here is a BatchNorm CNN, which is what reflow rewrites the running
-statistics of. To add a model, add one ``ModelSpec`` to ``MODELS``; nothing else
-needs editing.
+Two families live here, and :func:`norm_kind` tells them apart by inspecting the
+model rather than by a registry field, so the two stay in sync automatically:
+
+* **BatchNorm CNNs** -- reflow rewrites their stored running mean/var.
+* **LayerNorm ViTs** -- LayerNorm stores no statistics, so reflow instead
+  calibrates the LayerNorm affine parameters (see ``reflow.calibration``).
+
+To add a model, add one ``ModelSpec`` to ``MODELS``; nothing else needs editing.
 """
 
 import os
@@ -119,6 +124,14 @@ MODELS = {
         builder=tvm.resnext101_32x8d, dataset="imagenet",
         weights="IMAGENET1K_V2", reference_top1=82.83,
         description="ResNeXt-101 32x8d"),
+    "vit_b_16": ModelSpec(
+        builder=tvm.vit_b_16, dataset="imagenet",
+        weights="IMAGENET1K_V1", reference_top1=81.07,
+        description="ViT-B/16 (LayerNorm)"),
+    "vit_l_32": ModelSpec(
+        builder=tvm.vit_l_32, dataset="imagenet",
+        weights="IMAGENET1K_V1", reference_top1=76.97,
+        description="ViT-L/32 (LayerNorm)"),
 }
 
 SUPPORTED_MODELS = list(MODELS)
@@ -136,6 +149,10 @@ _ALIASES = {
     "regnet_x": "regnet_x_32gf",
     "resnext101_32x8d": "resnext101",
     "resnext-101": "resnext101",
+    "vit_b16": "vit_b_16",
+    "vit-b/16": "vit_b_16",
+    "vit_l32": "vit_l_32",
+    "vit-l/32": "vit_l_32",
 }
 
 
@@ -170,7 +187,34 @@ def load_model(name, device=None):
     return model, spec
 
 
-def batchnorm_layers(model):
-    """``(name, module)`` for every BatchNorm2d, in ``named_modules`` order."""
-    return [(n, m) for n, m in model.named_modules()
-            if isinstance(m, nn.BatchNorm2d)]
+# Which normalization mechanism carries a model's activation statistics. This
+# selects both the reflow strategy and the layer type the variance-ratio
+# analysis hooks.
+NORM_BATCH = "batchnorm"
+NORM_LAYER = "layernorm"
+
+_BN_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+
+
+def norm_kind(model):
+    """
+    ``NORM_BATCH`` or ``NORM_LAYER``, decided by what the model actually
+    contains rather than by a registry field.
+
+    BatchNorm wins if a model somehow has both, since stored running statistics
+    are the thing reflow can correct exactly.
+    """
+    modules = list(model.modules())
+    if any(isinstance(m, _BN_TYPES) for m in modules):
+        return NORM_BATCH
+    if any(isinstance(m, nn.LayerNorm) for m in modules):
+        return NORM_LAYER
+    raise ValueError(
+        "model has neither BatchNorm nor LayerNorm layers, so it carries no "
+        "normalization statistics for reflow to act on")
+
+
+def norm_layers(model):
+    """``(name, module)`` for every normalization layer reflow acts on."""
+    wanted = _BN_TYPES if norm_kind(model) == NORM_BATCH else nn.LayerNorm
+    return [(n, m) for n, m in model.named_modules() if isinstance(m, wanted)]

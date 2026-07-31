@@ -20,16 +20,24 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from .models import NORM_BATCH, _BN_TYPES, norm_kind
 
-def _channel_variance(tensor):
-    """Per-channel variance of an (N, C, H, W) activation, reduced over N, H, W."""
-    return tensor.var(dim=[d for d in range(tensor.dim()) if d != 1], unbiased=False)
+
+def _channel_variance(tensor, channel_dim):
+    """
+    Per-channel variance, reducing over every dimension except ``channel_dim``.
+
+    Covers both layouts in play: (N, C, H, W) for BatchNorm, where channels are
+    dim 1, and (N, tokens, D) for LayerNorm, where features are the last.
+    """
+    dims = [d for d in range(tensor.dim()) if d != channel_dim % tensor.dim()]
+    return tensor.var(dim=dims, unbiased=False)
 
 
 @torch.no_grad()
 def collect_activation_variance(model, batches, device, progress=True):
     """
-    Measure per-channel activation variance at every BatchNorm layer.
+    Measure per-channel activation variance at every normalization layer.
 
     Returns ``(stats, order)`` where ``stats[name]`` holds the ``"input"``
     (pre-normalization) and ``"output"`` (post-normalization) variance as a
@@ -37,6 +45,10 @@ def collect_activation_variance(model, batches, device, progress=True):
     names in true forward-execution order -- which is what the plots index over
     and is not always the order ``named_modules`` reports.
     """
+    is_batchnorm = norm_kind(model) == NORM_BATCH
+    layer_types = _BN_TYPES if is_batchnorm else (nn.LayerNorm,)
+    channel_dim = 1 if is_batchnorm else -1
+
     totals, counts, order = {}, {}, []
 
     def _hook(name):
@@ -45,16 +57,16 @@ def collect_activation_variance(model, batches, device, progress=True):
                 order.append(name)
                 totals[name] = {"input": 0.0, "output": 0.0}
                 counts[name] = 0
-            totals[name]["input"] += _channel_variance(inputs[0]).cpu()
-            totals[name]["output"] += _channel_variance(output).cpu()
+            totals[name]["input"] += _channel_variance(inputs[0], channel_dim).cpu()
+            totals[name]["output"] += _channel_variance(output, channel_dim).cpu()
             counts[name] += 1
         return fn
 
     handles = [module.register_forward_hook(_hook(name))
                for name, module in model.named_modules()
-               if isinstance(module, nn.BatchNorm2d)]
+               if isinstance(module, layer_types)]
     if not handles:
-        raise ValueError("model has no BatchNorm2d layers to measure")
+        raise ValueError("model has no normalization layers to measure")
 
     model.eval()
     try:

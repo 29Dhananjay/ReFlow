@@ -14,10 +14,15 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .calibration import DEFAULT_CALIBRATION_BATCHES, reflow
+from .calibration import (
+    DEFAULT_CALIBRATION_BATCHES,
+    DEFAULT_LAYERNORM_BATCHES,
+    DEFAULT_LAYERNORM_LR,
+    reflow,
+)
 from .data import cache_batches, load_dataset
 from .evaluation import evaluate
-from .models import get_spec, load_model, resolve_model_name
+from .models import NORM_BATCH, get_spec, load_model, norm_kind, resolve_model_name
 from .pruning import GLOBAL, prune_model, sparsity
 from .signal import collect_activation_variance, variance_ratios
 
@@ -70,9 +75,10 @@ def resolve_device(device=None):
 
 def run_experiment(model_name, dataset=None, target_sparsity=0.8,
                    pruning_method=GLOBAL, batch_size=128, num_workers=8,
-                   calibration_batches=DEFAULT_CALIBRATION_BATCHES,
-                   variance_batches=16, measure_variance=False, data_path=None,
-                   device=None, limit_eval_batches=None, seed=0, log=print):
+                   calibration_batches=None, variance_batches=16,
+                   measure_variance=False, data_path=None, device=None,
+                   limit_eval_batches=None, lr=DEFAULT_LAYERNORM_LR, seed=0,
+                   log=print):
     """
     Run dense -> pruned -> reflowed and report accuracy at each stage.
 
@@ -81,7 +87,9 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
     ``dataset``               registered dataset name; defaults to the one the
                               model was trained on. Passing an incompatible one
                               is an error rather than a silently wrong number.
-    ``calibration_batches``   batches reflow consumes.
+    ``calibration_batches``   batches reflow consumes. Defaults to 50 for a
+                              BatchNorm model, 500 for a LayerNorm one, which
+                              needs the larger budget to converge.
     ``measure_variance``      also measure the per-layer variance ratio of the
                               pruned and reflowed models against the dense one.
     ``variance_batches``      batches used for that measurement (a prefix of the
@@ -118,14 +126,28 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
         dataset, batch_size=batch_size, num_workers=num_workers,
         data_path=data_path, seed=seed, eval_subset=eval_subset)
 
-    # Reflow and the variance measurement must see the same inputs across all
-    # three models, so the calibration batches are drawn once and replayed. They
-    # are kept on CPU and moved a batch at a time. Reflow consumes them all; the
-    # variance measurement takes a prefix, so cache whichever is larger.
-    n_cached = max(calibration_batches, variance_batches if measure_variance else 0)
-    log(f"caching {n_cached} calibration batches "
-        f"({n_cached * batch_size} images) ...")
-    batches = cache_batches(calibration_loader, n_cached)
+    # --- stage 1: dense -----------------------------------------------------
+    model, _ = load_model(model_name, device=device)
+
+    # The strategy reflow will use, and therefore the calibration budget, comes
+    # from the model itself: BatchNorm replays cached inputs, LayerNorm fits
+    # affine parameters from the labeled loader and needs far more batches.
+    is_batchnorm = norm_kind(model) == NORM_BATCH
+    if calibration_batches is None:
+        calibration_batches = (DEFAULT_CALIBRATION_BATCHES if is_batchnorm
+                               else DEFAULT_LAYERNORM_BATCHES)
+
+    # Whatever the strategy, the variance measurement must replay *identical*
+    # inputs through all three models, so those batches are drawn once and
+    # cached on CPU. BatchNorm reflow reuses them; LayerNorm reflow does not,
+    # so there only the measurement batches are worth caching.
+    n_cached = max(calibration_batches if is_batchnorm else 0,
+                   variance_batches if measure_variance else 0)
+    batches = []
+    if n_cached:
+        log(f"caching {n_cached} calibration batches "
+            f"({n_cached * batch_size} images) ...")
+        batches = cache_batches(calibration_loader, n_cached)
     variance_input = batches[:variance_batches]
 
     def variance_of(model):
@@ -133,8 +155,6 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
             return None, None
         return collect_activation_variance(model, variance_input, device)
 
-    # --- stage 1: dense -----------------------------------------------------
-    model, _ = load_model(model_name, device=device)
     log("evaluating dense model ...")
     accuracy = {DENSE: evaluate(model, eval_loader, device, desc="dense")}
     reference = spec.reference_top1
@@ -157,7 +177,9 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
     # --- stage 3: reflow ----------------------------------------------------
     log(f"applying reflow ({calibration_batches} calibration batches) ...")
     reflowed = copy.deepcopy(pruned)
-    reflow_info = reflow(reflowed, batches[:calibration_batches], device)
+    reflow_info = reflow(reflowed, batches=batches[:calibration_batches],
+                         device=device, loader=calibration_loader,
+                         num_batches=calibration_batches, lr=lr)
     accuracy[REFLOWED] = evaluate(reflowed, eval_loader, device, desc="reflow")
     log(f"  {REFLOWED}: {accuracy[REFLOWED]:.2f}%")
     reflowed_stats, _ = variance_of(reflowed)

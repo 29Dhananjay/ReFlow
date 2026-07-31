@@ -1,4 +1,4 @@
-# reflow
+# ReFlow
 
 Restoring signal variance in one-shot pruned vision models.
 
@@ -11,7 +11,10 @@ representations, and accuracy collapses.
 
 **Reflow fixes the normalizer instead of retraining the weights**: it recomputes
 each BatchNorm's running mean/var from the pruned model's own activations over a
-few dozen forward passes. No gradients, no weight updates, tens of seconds.
+few dozen forward passes. No gradients, no weight updates, tens of seconds. For
+LayerNorm models, which store no such statistics, it fits the LayerNorm affine
+parameters instead — same idea, different mechanics
+([details](#reflow-bn-vs-reflow-ln)).
 
 Measured on the full evaluation split, 50 calibration batches, one-shot global
 magnitude pruning:
@@ -21,6 +24,17 @@ magnitude pruning:
 | ResNeXt-101 32x8d (ImageNet) | 80% | 82.44% | 0.60% | **77.92%** |
 | ResNet-50 (ImageNet) | 80% | 76.13% | 3.31% | **54.18%** |
 | ResNet-20 (CIFAR-10) | 90% | 91.43% | 10.23% | **47.83%** |
+| ViT-B/16 (ImageNet)&nbsp;† | 70% | 81.07% | 1.09% | **57.90%** |
+
+† ViT takes the LayerNorm route, which works differently and uses a larger
+calibration budget (500 batches) — see
+[ReFlow-BN vs ReFlow-LN](#reflow-bn-vs-reflow-ln).
+
+![Per-layer variance ratio for ResNet-50 at 80% sparsity](assets/variance_ratio_resnet50_sp80.png)
+
+Pruned ResNet-50 (blue) decays from η ≈ 1.05 at the first BatchNorm to 0.223 at
+the last — that decay *is* the accuracy collapse. After reflow (orange) every
+layer sits back on 1.0 (median 0.996).
 
 ---
 
@@ -133,7 +147,8 @@ Useful flags:
 |---|---|
 | `--sparsity` | fraction of prunable weights removed (default `0.8`) |
 | `--pruning` | `global` magnitude ranking across the network, or `layerwise` |
-| `--calibration-batches` | batches reflow recomputes statistics over (default 50) |
+| `--calibration-batches` | batches reflow consumes (default 50 for BatchNorm, 500 for LayerNorm) |
+| `--lr` | Adam learning rate for LayerNorm calibration; ignored by BatchNorm models |
 | `--variance-batches` | batches used to measure activation variance (default 16) |
 | `--limit-batches` | cap every accuracy measurement — smoke runs only |
 | `--batch-size`, `--num-workers`, `--device`, `--seed` | the usual |
@@ -157,6 +172,8 @@ reflow --model resnet20 --sparsity 0.9 --plot
 | `resnet152` | ImageNet | 78.31% | torchvision |
 | `regnet_x_32gf` | ImageNet | 80.62% | torchvision |
 | `resnext101` | ImageNet | 82.83% | torchvision |
+| `vit_b_16` | ImageNet | 81.07% | torchvision |
+| `vit_l_32` | ImageNet | 76.97% | torchvision |
 
 `--dataset` defaults to the one a model was trained on, so it only needs
 spelling out when you want it in the run name. torchvision weight enums are
@@ -164,9 +181,50 @@ pinned per model rather than tracking `DEFAULT`, so the dense baseline is
 reproducible — the CLI prints the published top-1 next to the measured one, and
 a large gap means the data path or transforms are wrong.
 
-Every model must have `nn.BatchNorm2d` layers, since those are what reflow
-rewrites. Architectures that normalize per sample (LayerNorm) keep no running
-statistics and are out of scope.
+## ReFlow-BN vs ReFlow-LN
+
+Both strategies are implemented, and `reflow()` picks between them by inspecting
+the model — there is no flag to get wrong.
+
+The failure being repaired is the same in both cases: pruning shrinks activation
+variance, the normalizer does not know, the shortfall compounds with depth. What
+differs is whether the normalizer *stores* anything you can correct.
+
+**ReFlow-BN** (`resnet*`, `regnet*`, `resnext*`, `mobilenet`). BatchNorm keeps
+`running_mean` and `running_var` buffers, frozen at inference and inherited from
+the dense model. Those buffers are simply wrong for the pruned network, so
+reflow overwrites them with statistics measured from the pruned network's own
+activations. Post-BN variance then returns to γ² by construction — one shot,
+exactly, no search.
+
+**ReFlow-LN** (`vit_b_16`, `vit_l_32`). LayerNorm computes its mean and variance
+per sample at run time, so there are no stale buffers to overwrite —
+normalization is already "correct" for whatever it is handed. The only
+persistent handles on scale are the affine parameters γ and β, and there is no
+closed form for what they should become, so they have to be *fitted*.
+
+|  | ReFlow-BN | ReFlow-LN |
+|---|---|---|
+| architectures | BatchNorm CNNs | LayerNorm transformers (ViT) |
+| what it changes | `running_mean` / `running_var` **buffers** | LayerNorm **parameters** γ, β |
+| model weights | untouched | untouched (everything but LN is frozen) |
+| mechanism | measure statistics, overwrite | minimize cross-entropy with Adam |
+| gradients | none | forward **and** backward |
+| calibration data | unlabeled inputs | **labeled** examples |
+| convergence | exact, ~50 forward passes, seconds | iterative, ~500 steps, minutes |
+| tuning knobs | none | `--lr` (Adam, default `1e-3`) |
+| `--calibration-batches` default | 50 | 500 |
+
+The last two rows are the practical difference. ReFlow-BN is an estimator: 50
+batches gives you the answer and more batches change nothing. ReFlow-LN is an
+optimization, so an undersized budget underperforms silently rather than
+failing — on ViT-B/16 at 70% sparsity the full 500 batches recover 57.90%,
+while a 60-batch run of the same model reached only ~11% (measured on a 5k-image
+subset). If a ViT run disappoints, raise `--calibration-batches` before
+concluding anything about the method.
+
+Both are training-free in the sense that matters for pruning — no model weight
+is updated — but only ReFlow-BN is gradient-free.
 
 ## Library
 
@@ -207,7 +265,7 @@ reflow/
   models.py         model registry -> load_model()
   data.py           dataset registry -> load_dataset()
   pruning.py        one-shot magnitude pruning, sparsity, masks
-  calibration.py    reflow: recompute BatchNorm running statistics
+  calibration.py    reflow: BatchNorm statistics, or LayerNorm affine
   signal.py         per-layer activation variance and eta ratios
   evaluation.py     top-1 accuracy
   plotting.py       variance-ratio and accuracy figures
@@ -226,12 +284,18 @@ checkpoints exactly — renaming an attribute or folding blocks into
 and reflowed models, so the three curves are directly comparable. Two things are
 worth knowing when interpreting a run:
 
-- **Reflow lands slightly above 1.0**, typically 1.2–1.4, not exactly 1. After
-  reflow, post-BN variance is γ² by construction, while the dense reference
-  divides by running statistics accumulated during training, which do not
-  exactly match dense activations on the calibration batches. The offset is
-  expected.
+- **Reflow lands near 1.0, sometimes above it.** ResNet-50 comes back to a
+  median η of 0.996; ResNeXt-101 settles at 1.383. Overshoot is expected rather
+  than a fault: after reflow, post-BN variance is γ² by construction, while the
+  dense reference divides by running statistics accumulated during training,
+  which need not match dense activations on the calibration batches. The
+  denominator, not the numerator, is what drifts.
+- **It is the same measurement for both strategies.** On ViT-B/16 the LayerNorm
+  outputs decay to a median η of 0.612 under pruning and come back to 0.986
+  after calibration — the same curve shape as the CNNs, which is the evidence
+  that ReFlow-BN and ReFlow-LN are treating one phenomenon by two routes.
 - **The last stage of some networks inflates rather than decays.** ResNeXt-101's
-  `layer4` runs η > 1 even before reflow, which is why the summary reports the
-  median over layers as well as the final-layer value — the median is the robust
-  read of whether the signal collapsed.
+  `layer4` runs η > 1 even before reflow (3.888 at the final layer), so the
+  final-layer value alone would read as though reflow made things worse. That is
+  why the summary reports the median over layers as well — the median is the
+  robust read of whether the signal collapsed.

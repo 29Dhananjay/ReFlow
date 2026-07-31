@@ -11,7 +11,7 @@ import os
 import sys
 from statistics import median
 
-from .calibration import DEFAULT_CALIBRATION_BATCHES
+from .calibration import DEFAULT_LAYERNORM_LR
 from .data import SUPPORTED_DATASETS
 from .models import MODELS, SUPPORTED_MODELS, get_spec, resolve_model_name
 from .pipeline import DENSE, PRUNED, REFLOWED, run_experiment
@@ -42,15 +42,19 @@ def build_parser():
 
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--calibration-batches", type=int,
-                        default=DEFAULT_CALIBRATION_BATCHES,
-                        help="Batches reflow recomputes BatchNorm statistics over.")
+    parser.add_argument("--calibration-batches", type=int, default=None,
+                        help="Batches reflow consumes. Default: 50 for a "
+                             "BatchNorm model, 500 for a LayerNorm one.")
     parser.add_argument("--variance-batches", type=int, default=16,
                         help="Batches used to measure activation variance.")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="Cap every accuracy measurement to this many batches, "
                              "drawn as a fixed random subset of the evaluation "
                              "split (smoke runs only).")
+    parser.add_argument("--lr", type=float, default=DEFAULT_LAYERNORM_LR,
+                        help="Learning rate for LayerNorm affine calibration. "
+                             "Ignored by BatchNorm models, which take no gradient steps.")
+
     parser.add_argument("--data-path", default=None,
                         help="Override the registered dataset location.")
     parser.add_argument("--device", default=None, help="Defaults to cuda when available.")
@@ -128,6 +132,7 @@ def main(argv=None):
             data_path=args.data_path,
             device=args.device,
             limit_eval_batches=args.limit_batches,
+            lr=args.lr,
             seed=args.seed,
             log=log,
         )

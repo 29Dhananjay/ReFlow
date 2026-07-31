@@ -17,3 +17,4 @@ results/
 # Editor / local tooling
 .vscode/
 .claude/settings.local.json
+CLAUDE.md
