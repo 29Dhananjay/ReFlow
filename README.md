@@ -1,4 +1,4 @@
-# ReFlow
+# ReFlow: CNNs and Vision Transformers
 
 Restoring signal variance in one-shot pruned vision models.
 
