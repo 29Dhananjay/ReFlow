@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reflow"
+version = "0.1.0"
+description = "Restore activation variance in one-shot pruned vision models"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["pruning", "sparsity", "batchnorm", "calibration", "computer-vision"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy",
+    "matplotlib",
+    "tqdm",
+]
+
+[project.scripts]
+reflow = "reflow.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["reflow*"]

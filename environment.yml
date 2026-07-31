@@ -1,0 +1,25 @@
+# Conda environment for reflow.
+#
+#   conda env create -f environment.yml
+#   conda activate reflow
+#   pip install -e .
+#
+# Versions are the ones the published numbers were produced on. The pytorch
+# channel resolves a CUDA build automatically on a CUDA machine; on a CPU-only
+# box replace `pytorch-cuda=12.4` with `cpuonly`.
+name: reflow
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.9
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - pytorch-cuda=12.4
+  - numpy=2.0.2
+  - matplotlib=3.9.4
+  - tqdm=4.67.1
+  - ipykernel          # only needed to run Reflow_CNNs.ipynb
