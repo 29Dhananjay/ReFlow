@@ -1,4 +1,4 @@
-# ReFlow: Restoring signal variance in one-shot pruned vision models.
+# ReFlow: Restoring signal variance in one-shot pruned vision models
 
 One-shot magnitude pruning shrinks the variance of every layer's
 pre-normalization activations, but the BatchNorm layers keep dividing by the
