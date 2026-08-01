@@ -11,7 +11,7 @@ import os
 import sys
 from statistics import median
 
-from .calibration import DEFAULT_LAYERNORM_LR
+from .calibration import DEFAULT_LAYERNORM_LR, LN_BACKPROP, LN_STRATEGIES
 from .data import SUPPORTED_DATASETS
 from .models import MODELS, SUPPORTED_MODELS, get_spec, resolve_model_name
 from .pipeline import DENSE, PRUNED, REFLOWED, run_experiment
@@ -43,8 +43,9 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--calibration-batches", type=int, default=None,
-                        help="Batches reflow consumes. Default: 50 for a "
-                             "BatchNorm model, 500 for a LayerNorm one.")
+                        help="Batches reflow consumes. Default: 50 for BatchNorm "
+                             "models and the analytic LayerNorm strategies, 500 "
+                             "for backprop LayerNorm fitting.")
     parser.add_argument("--variance-batches", type=int, default=16,
                         help="Batches used to measure activation variance.")
     parser.add_argument("--limit-batches", type=int, default=None,
@@ -52,8 +53,15 @@ def build_parser():
                              "drawn as a fixed random subset of the evaluation "
                              "split (smoke runs only).")
     parser.add_argument("--lr", type=float, default=DEFAULT_LAYERNORM_LR,
-                        help="Learning rate for LayerNorm affine calibration. "
-                             "Ignored by BatchNorm models, which take no gradient steps.")
+                        help="Learning rate for backprop LayerNorm affine calibration. "
+                             "Ignored by BatchNorm models and the analytic strategies, "
+                             "which take no gradient steps.")
+    parser.add_argument("--ln-strategy", choices=LN_STRATEGIES, default=LN_BACKPROP,
+                        help="How to reflow a LayerNorm (ViT) model: fit gamma/beta "
+                             "with labeled gradient steps (backprop, the baseline), "
+                             "or correct them in closed form from the dense model's "
+                             "statistics (moment, regression; forward passes only, "
+                             "no labels). Ignored by BatchNorm models.")
 
     parser.add_argument("--data-path", default=None,
                         help="Override the registered dataset location.")
@@ -112,7 +120,12 @@ def main(argv=None):
         parser.error(str(exc))
 
     dataset = args.dataset or spec.dataset
-    name = args.experiment_name or f"{model_name}_{dataset}_sp{args.sparsity}"
+    # A non-default LN strategy gets its own results folder, so comparing
+    # strategies for one model/sparsity never overwrites an earlier run.
+    default_name = f"{model_name}_{dataset}_sp{args.sparsity}"
+    if args.ln_strategy != LN_BACKPROP:
+        default_name += f"_{args.ln_strategy}"
+    name = args.experiment_name or default_name
     out_dir = os.path.join(args.output_dir, name)
 
     def log(message):
@@ -133,6 +146,7 @@ def main(argv=None):
             device=args.device,
             limit_eval_batches=args.limit_batches,
             lr=args.lr,
+            ln_strategy=args.ln_strategy,
             seed=args.seed,
             log=log,
         )

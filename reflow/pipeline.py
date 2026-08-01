@@ -8,6 +8,7 @@ per-layer variance ratio behind those numbers.
 """
 
 import copy
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -18,6 +19,8 @@ from .calibration import (
     DEFAULT_CALIBRATION_BATCHES,
     DEFAULT_LAYERNORM_BATCHES,
     DEFAULT_LAYERNORM_LR,
+    LN_BACKPROP,
+    LN_STRATEGIES,
     reflow,
 )
 from .data import cache_batches, load_dataset
@@ -77,8 +80,8 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
                    pruning_method=GLOBAL, batch_size=128, num_workers=8,
                    calibration_batches=None, variance_batches=16,
                    measure_variance=False, data_path=None, device=None,
-                   limit_eval_batches=None, lr=DEFAULT_LAYERNORM_LR, seed=0,
-                   log=print):
+                   limit_eval_batches=None, lr=DEFAULT_LAYERNORM_LR,
+                   ln_strategy=LN_BACKPROP, seed=0, log=print):
     """
     Run dense -> pruned -> reflowed and report accuracy at each stage.
 
@@ -88,8 +91,15 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
                               model was trained on. Passing an incompatible one
                               is an error rather than a silently wrong number.
     ``calibration_batches``   batches reflow consumes. Defaults to 50 for a
-                              BatchNorm model, 500 for a LayerNorm one, which
-                              needs the larger budget to converge.
+                              BatchNorm model and for the analytic LayerNorm
+                              strategies (both estimate statistics), 500 for
+                              backprop LayerNorm fitting, which needs the
+                              larger budget to converge.
+    ``ln_strategy``           how a LayerNorm model is reflowed: ``"backprop"``
+                              fits gamma/beta on labeled batches; ``"moment"``
+                              and ``"regression"`` correct them in closed form
+                              against the dense model's statistics, forward
+                              passes only. Ignored by BatchNorm models.
     ``measure_variance``      also measure the per-layer variance ratio of the
                               pruned and reflowed models against the dense one.
     ``variance_batches``      batches used for that measurement (a prefix of the
@@ -103,6 +113,9 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
     """
     if not 0.0 < target_sparsity < 1.0:
         raise ValueError(f"target sparsity must be in (0, 1), got {target_sparsity}")
+    if ln_strategy not in LN_STRATEGIES:
+        raise ValueError(
+            f"unknown LayerNorm strategy {ln_strategy!r}, expected one of {LN_STRATEGIES}")
 
     model_name = resolve_model_name(model_name)
     spec = get_spec(model_name)
@@ -112,6 +125,7 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
             f"model {model_name!r} was trained on {spec.dataset!r} and cannot be "
             f"evaluated on {dataset!r} (different input size / class count).")
 
+    t_start = time.perf_counter()
     device = resolve_device(device)
     torch.manual_seed(seed)
 
@@ -130,18 +144,23 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
     model, _ = load_model(model_name, device=device)
 
     # The strategy reflow will use, and therefore the calibration budget, comes
-    # from the model itself: BatchNorm replays cached inputs, LayerNorm fits
-    # affine parameters from the labeled loader and needs far more batches.
+    # from the model itself: BatchNorm replays cached inputs, backprop
+    # LayerNorm fits affine parameters from the labeled loader and needs far
+    # more batches. The analytic LayerNorm strategies are estimators like
+    # BatchNorm reflow, so they share its cached inputs and small budget.
     is_batchnorm = norm_kind(model) == NORM_BATCH
+    ln_analytic = not is_batchnorm and ln_strategy != LN_BACKPROP
     if calibration_batches is None:
-        calibration_batches = (DEFAULT_CALIBRATION_BATCHES if is_batchnorm
+        calibration_batches = (DEFAULT_CALIBRATION_BATCHES
+                               if is_batchnorm or ln_analytic
                                else DEFAULT_LAYERNORM_BATCHES)
 
     # Whatever the strategy, the variance measurement must replay *identical*
     # inputs through all three models, so those batches are drawn once and
-    # cached on CPU. BatchNorm reflow reuses them; LayerNorm reflow does not,
-    # so there only the measurement batches are worth caching.
-    n_cached = max(calibration_batches if is_batchnorm else 0,
+    # cached on CPU. BatchNorm reflow and the analytic LayerNorm strategies
+    # reuse them; backprop LayerNorm reflow does not, so there only the
+    # measurement batches are worth caching.
+    n_cached = max(calibration_batches if (is_batchnorm or ln_analytic) else 0,
                    variance_batches if measure_variance else 0)
     batches = []
     if n_cached:
@@ -170,16 +189,31 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
     log(f"  {PRUNED}: {accuracy[PRUNED]:.2f}%  (measured sparsity {measured_sparsity:.4f})")
     pruned_stats, _ = variance_of(pruned)
 
-    del model                          # dense model is no longer needed
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    # The analytic LayerNorm strategies still need the dense model as their
+    # statistical reference; every other path is done with it.
+    if not ln_analytic:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # --- stage 3: reflow ----------------------------------------------------
-    log(f"applying reflow ({calibration_batches} calibration batches) ...")
+    log(f"applying reflow ({calibration_batches} calibration batches"
+        + (f", {ln_strategy} strategy" if not is_batchnorm else "") + ") ...")
     reflowed = copy.deepcopy(pruned)
+    t_reflow = time.perf_counter()
     reflow_info = reflow(reflowed, batches=batches[:calibration_batches],
                          device=device, loader=calibration_loader,
-                         num_batches=calibration_batches, lr=lr)
+                         num_batches=calibration_batches, lr=lr,
+                         ln_strategy=ln_strategy,
+                         dense_model=model if ln_analytic else None)
+    # The wall-clock cost of the calibration itself is a headline number for
+    # reflow (the whole point is being cheap), so it is measured, not estimated.
+    reflow_info["seconds"] = round(time.perf_counter() - t_reflow, 2)
+    log(f"  reflow calibration took {reflow_info['seconds']:.1f}s")
+    if ln_analytic:
+        del model                      # reference served; free it before evaluation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     accuracy[REFLOWED] = evaluate(reflowed, eval_loader, device, desc="reflow")
     log(f"  {REFLOWED}: {accuracy[REFLOWED]:.2f}%")
     reflowed_stats, _ = variance_of(reflowed)
@@ -208,10 +242,12 @@ def run_experiment(model_name, dataset=None, target_sparsity=0.8,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "device": str(device),
             "pruning_method": pruning_method,
+            "ln_strategy": None if is_batchnorm else ln_strategy,
             "batch_size": batch_size,
             "seed": seed,
             "limit_eval_batches": limit_eval_batches,
             "variance_batches": variance_batches if measure_variance else None,
             "reference_top1": reference,
+            "total_seconds": round(time.perf_counter() - t_start, 2),
         },
     )

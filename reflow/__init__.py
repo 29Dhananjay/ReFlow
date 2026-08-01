@@ -33,9 +33,14 @@ model weight.
 from .calibration import (
     DEFAULT_CALIBRATION_BATCHES,
     DEFAULT_LAYERNORM_BATCHES,
+    LN_BACKPROP,
+    LN_MOMENT,
+    LN_REGRESSION,
+    LN_STRATEGIES,
     reflow,
     reflow_batchnorm,
     reflow_layernorm,
+    reflow_layernorm_analytic,
 )
 from .data import DATASETS, SUPPORTED_DATASETS, cache_batches, load_dataset
 from .evaluation import evaluate
@@ -79,8 +84,9 @@ __all__ = [
     "prune_model", "sparsity", "layerwise_sparsity", "finalize_pruning",
     "get_prunable_layers", "get_prune_masks",
     # reflow
-    "reflow", "reflow_batchnorm", "reflow_layernorm",
+    "reflow", "reflow_batchnorm", "reflow_layernorm", "reflow_layernorm_analytic",
     "DEFAULT_CALIBRATION_BATCHES", "DEFAULT_LAYERNORM_BATCHES",
+    "LN_BACKPROP", "LN_MOMENT", "LN_REGRESSION", "LN_STRATEGIES",
     # measurement
     "evaluate", "collect_activation_variance", "variance_ratios", "final_layer_ratio",
     # pipeline
